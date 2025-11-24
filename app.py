@@ -1,23 +1,22 @@
 # app.py
-# Smart Suggestion App — single-file Streamlit app
-# - Search (press Enter) + price filters (supports 10k, 10,000)
-# - Product grid + product details + content-based recommendations
-# - Loads sample data if ./data/prod_meta.csv missing
-# - Shows debug info; uses uploaded debug file path below
+# Hybrid Amazon-Full UI with ChatGPT-style Assistant (left) + Product Grid (right)
+# Minimal hybrid version: uses lightweight TF-IDF, loads sample data if prod_meta.csv missing.
 
 UPLOADED_DEBUG_FILE = "/mnt/data/eaef5e07-5416-44ce-90af-b3484e5b8768.json"
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import os, json, re, math
+import joblib, json, os, time, random
+from typing import List
+import re, math
 from collections import Counter, defaultdict
 
-st.set_page_config(page_title="Smart Suggestion App", layout="wide")
+st.set_page_config(layout="wide", page_title="Amazon-Full — Smart Recommender", initial_sidebar_state="collapsed")
 BASE_DIR = "./data"
 
 # -------------------------
-# Lightweight TF-IDF helpers
+# Lightweight TF-IDF + Cosine Similarity (NO sklearn)
 # -------------------------
 def tokenize(text):
     toks = re.findall(r"[a-z0-9]+", str(text).lower())
@@ -37,11 +36,11 @@ def build_tfidf_matrix(docs, max_features=6000):
     vocab_index = {t:i for i,t in enumerate(vocab)}
     n_docs = len(docs)
     n_terms = len(vocab)
-    if n_docs == 0 or n_terms == 0:
+    if n_terms == 0 or n_docs == 0:
         return vocab, np.zeros((n_docs, n_terms), dtype=np.float32)
     idf = np.zeros(n_terms, dtype=np.float32)
     for t,i in vocab_index.items():
-        df = term_doc_count.get(t, 0)
+        df = term_doc_count.get(t,0)
         idf[i] = math.log((1 + n_docs) / (1 + df)) + 1.0
     mat = np.zeros((n_docs, n_terms), dtype=np.float32)
     for d_idx, c in enumerate(term_freqs):
@@ -76,10 +75,11 @@ def build_text_index_simple(df, text_cols=None, max_features=6000, id_col='item_
     return {"vocab": vocab, "mat": mat, "index_map": index_map}
 
 # -------------------------
-# Load data
+# Utilities & loading
 # -------------------------
 @st.cache_resource
 def load_prod_meta(path=os.path.join(BASE_DIR, "prod_meta.csv")):
+    # if not present, create a small sample dataset so UI demonstrates features
     if not os.path.exists(path):
         cols = ["item_id","title","category_id","brand","price","item_code","image_url","description"]
         sample = [
@@ -91,8 +91,6 @@ def load_prod_meta(path=os.path.join(BASE_DIR, "prod_meta.csv")):
             ["p006","Realme Narzo","phones","Realme",10999,1006,"https://via.placeholder.com/200x150.png?text=Realme+Narzo","Realme Narzo series phone."]
         ]
         df = pd.DataFrame(sample, columns=cols)
-        # ensure price numeric
-        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0).astype(int)
         return df
     df = pd.read_csv(path)
     df.columns = [c.strip() for c in df.columns]
@@ -107,221 +105,475 @@ def load_prod_meta(path=os.path.join(BASE_DIR, "prod_meta.csv")):
         df["item_code"] = df["item_code"].astype(int)
     except Exception:
         pass
-    # ensure price numeric even if CSV has commas or strings
-    try:
-        df['price'] = pd.to_numeric(df['price'].astype(str).str.replace(',',''), errors='coerce').fillna(0).astype(int)
-    except Exception:
-        df['price'] = 0
     return df
 
-prod_df = load_prod_meta()
+@st.cache_resource
+def load_artifacts(base_dir=BASE_DIR):
+    art = {}
+    def safe_load(path):
+        try:
+            return joblib.load(path)
+        except Exception:
+            return None
+    art["als"] = safe_load(os.path.join(base_dir, "als_model.joblib"))
+    art["user_le"] = safe_load(os.path.join(base_dir, "user_le.joblib"))
+    art["item_le"] = safe_load(os.path.join(base_dir, "item_le.joblib"))
+    art["user_item_matrix"] = safe_load(os.path.join(base_dir, "user_item_matrix.joblib"))
+    art["item_user_matrix"] = safe_load(os.path.join(base_dir, "item_user_matrix.joblib"))
+    art["popular"] = safe_load(os.path.join(base_dir, "popular_items.joblib")) or []
+    try:
+        with open(os.path.join(base_dir, "co_view_top.json"), "r") as f:
+            art["co_view"] = json.load(f)
+    except Exception:
+        art["co_view"] = {}
+    return art
 
-# build TF-IDF index
+# load data & artifacts
+prod_df = load_prod_meta()
+arts = load_artifacts()
+
+# -------------------------
+# build lightweight TF-IDF index for content similarity
+# -------------------------
 @st.cache_resource
 def build_text_index(df):
-    return build_text_index_simple(df, text_cols=["title","description"], max_features=4000)
+    return build_text_index_simple(df, text_cols=["title","description"], max_features=6000)
 
 text_index = build_text_index(prod_df)
-TFIDF_MAT = text_index['mat']
-IDX_TO_ITEM = text_index['index_map']
-ITEM_TO_IDX = {str(v): k for k,v in IDX_TO_ITEM.items()}
+tfidf_matrix = text_index["mat"] if text_index is not None else None
+index_to_itemid = text_index["index_map"] if text_index is not None else {}
+itemid_to_idx = {str(v):k for k,v in index_to_itemid.items()}
+idx_to_itemid = {k: str(v) for k,v in index_to_itemid.items()}
+
+# Session state defaults
+if "cart" not in st.session_state:
+    st.session_state.cart = {}
+if "recent_views" not in st.session_state:
+    st.session_state.recent_views = []
+if "assistant_history" not in st.session_state:
+    st.session_state.assistant_history = []
+if "filters" not in st.session_state:
+    st.session_state.filters = {"budget_min": None, "budget_max": None, "brands": [], "use_case": None, "categories": []}
+if "last_viewed" not in st.session_state:
+    st.session_state.last_viewed = None
+if "user_id" not in st.session_state:
+    st.session_state.user_id = None
 
 # -------------------------
-# Helpers: parse human price text like "10k", "10,000"
+# Assistant parsing & scoring
 # -------------------------
-def parse_price_input_raw(s):
-    if s is None:
-        return 0
-    stx = str(s).strip().lower()
-    if stx == "" or stx in ["0","0.0"]:
-        return 0
-    stx = stx.replace(",", "").replace("₹","")
-    # support "10k" and "10.5k"
-    if stx.endswith("k"):
-        try:
-            return int(float(stx[:-1]) * 1000)
-        except:
-            return 0
-    # support plain numbers
+def parse_assistant_message(text: str):
+    text_l = text.lower()
+    filters = {}
+    m = re.search(r"under\s+([0-9,]+)", text_l) or re.search(r"below\s+([0-9,]+)", text_l)
+    if m:
+        filters["budget_max"] = int(m.group(1).replace(",",""))
+    m = re.search(r"above\s+([0-9,]+)", text_l)
+    if m:
+        filters["budget_min"] = int(m.group(1).replace(",",""))
+    m = re.search(r"between\s+([0-9,]+)\s+and\s+([0-9,]+)", text_l)
+    if m:
+        filters["budget_min"] = int(m.group(1).replace(",",""))
+        filters["budget_max"] = int(m.group(2).replace(",",""))
+    use_cases = ["gaming","office","photography","video","travel","student","streaming","work","editing"]
+    for uc in use_cases:
+        if uc in text_l:
+            filters["use_case"] = uc; break
+    brands = prod_df["brand"].dropna().unique().tolist()
+    mentioned = [b for b in brands if b.lower() in text_l]
+    if mentioned:
+        filters["brands"] = mentioned[:6]
+    cats = prod_df["category_id"].dropna().unique().tolist()
+    cat_mentioned = [c for c in cats if c.lower() in text_l]
+    if cat_mentioned:
+        filters["categories"] = cat_mentioned[:6]
+    return filters
+
+def assistant_score(df: pd.DataFrame, f: dict):
+    scores = np.ones(len(df), dtype=float)
+    if f.get("budget_min") is not None:
+        scores *= np.where(df["price"] >= f["budget_min"], 1.0, 0.3)
+    if f.get("budget_max") is not None:
+        scores *= np.where(df["price"] <= f["budget_max"], 1.0, 0.3)
+    if f.get("brands"):
+        bset = set([b.lower() for b in f["brands"]])
+        scores *= np.where(df["brand"].str.lower().isin(bset), 1.3, 1.0)
+    if f.get("categories"):
+        cset = set([c.lower() for c in f["categories"]])
+        scores *= np.where(df["category_id"].str.lower().isin(cset), 1.2, 1.0)
+    if f.get("use_case"):
+        uc = f["use_case"].lower()
+        keywords = {
+            "gaming": ["gaming","rtx","geforce","ryzen","144hz","240hz","gpu"],
+            "photography": ["camera","lens","dslr","mirrorless","megapixel","stabiliz"],
+            "video": ["4k","video","stabiliz","gimbal","microphone"],
+            "travel": ["lightweight","compact","portable","battery"],
+            "student": ["budget","student","lightweight","ssd","office"]
+        }
+        kw = keywords.get(uc, [])
+        if kw:
+            txt = (df["title"].fillna("") + " " + df["description"].fillna("")).str.lower()
+            match_score = np.zeros(len(df))
+            for k in kw:
+                match_score += txt.str.contains(k).astype(float)
+            if match_score.max() > 0:
+                match_score = 1 + (match_score / (match_score.max()))
+                scores *= match_score
+    return scores
+
+# -------------------------
+# Candidate retrieval helpers
+# -------------------------
+def recommend_with_als(user_id, top_k=25):
     try:
-        return int(float(stx))
-    except:
-        return 0
-
-# -------------------------
-# Search and recommendation functions
-# -------------------------
-def search_products(query: str, min_price=None, max_price=None):
-    q = str(query).strip().lower()
-    df = prod_df.copy()
-    if q:
-        mask = df['title'].fillna('').str.lower().str.contains(q) | df['description'].fillna('').str.lower().str.contains(q)
-        df = df[mask]
-    if min_price is not None:
-        try:
-            df = df[df['price'] >= int(min_price)]
-        except:
-            pass
-    if max_price is not None and max_price > 0:
-        try:
-            df = df[df['price'] <= int(max_price)]
-        except:
-            pass
-    return df.reset_index(drop=True)
-
-def rec_content_sim(item_id, top_k=6):
-    sid = str(item_id)
-    if sid not in ITEM_TO_IDX:
+        if arts["als"] is None or arts["user_le"] is None or arts["item_le"] is None or arts["user_item_matrix"] is None:
+            return []
+        if user_id not in arts["user_le"].classes_:
+            return []
+        u_idx = int(arts["user_le"].transform([user_id])[0])
+        recs = arts["als"].recommend(userid=u_idx, user_items=arts["user_item_matrix"][u_idx], N=top_k)
+        codes = [int(r[0]) for r in recs]
+        ids = [arts["item_le"].inverse_transform([c])[0] for c in codes]
+        return ids
+    except Exception:
         return []
-    idx = ITEM_TO_IDX[sid]
-    sims = cosine_sim_rows(TFIDF_MAT, idx)
-    order = np.argsort(sims)[::-1]
+
+def co_view_for_item(item_id, top_k=20):
+    try:
+        if not arts["co_view"]:
+            return []
+        row = prod_df[prod_df["item_id"]==item_id]
+        if row.empty:
+            return []
+        code = str(int(row.iloc[0]["item_code"]))
+        codes = arts["co_view"].get(code, [])[:top_k]
+        if arts["item_le"] is not None:
+            try:
+                ids = [arts["item_le"].inverse_transform([int(c)])[0] for c in codes]
+                return ids
+            except Exception:
+                pass
+        ids = []
+        for c in codes:
+            rows = prod_df[prod_df["item_code"]==int(c)]
+            if not rows.empty:
+                ids.append(rows.iloc[0]["item_id"])
+        return ids
+    except Exception:
+        return []
+
+def content_similar(item_id, top_k=20):
+    try:
+        s_id = str(item_id)
+        if tfidf_matrix is None or s_id not in itemid_to_idx:
+            return []
+        idx = itemid_to_idx[s_id]
+        sims = cosine_sim_rows(tfidf_matrix, idx)
+        order = np.argsort(sims)[::-1]
+        results = []
+        for o in order:
+            if o == idx:
+                continue
+            results.append(idx_to_itemid[o])
+            if len(results) >= top_k:
+                break
+        return results
+    except Exception:
+        return []
+
+def popular_candidates(top_k=50):
     res = []
-    for o in order:
-        if o == idx:
-            continue
-        res.append(IDX_TO_ITEM[o])
-        if len(res) >= top_k:
-            break
+    for p in arts.get("popular", [])[:top_k]:
+        try:
+            if arts.get("item_le") is not None:
+                iid = arts["item_le"].inverse_transform([int(p)])[0]
+                res.append(iid)
+        except Exception:
+            rows = prod_df[prod_df["item_code"]==int(p)]
+            if not rows.empty:
+                res.append(rows.iloc[0]["item_id"])
+    if not res:
+        res = prod_df.sort_values("price", ascending=False)["item_id"].head(top_k).tolist()
     return res
 
 # -------------------------
-# UI Components (product card) - fixed nesting
+# Merge candidates & rerank
 # -------------------------
-def product_card(parent_col, row):
-    """
-    Render into the provided parent_col to avoid deep nested columns.
-    """
-    parent_col.image(row["image_url"] if row["image_url"] else "https://via.placeholder.com/200x150.png?text=No+Image", width=180)
-    parent_col.markdown(f"**{row['title']}**")
-    parent_col.markdown(f"Brand: {row.get('brand','')}")
+def merge_and_score(user_id: str, current_item: str, assistant_filters: dict, N=12):
+    candidates = []
+    # ALS
+    als_ids = recommend_with_als(user_id, top_k=50)
+    for i,iid in enumerate(als_ids):
+        candidates.append((iid, {"als_score": float(1.0/(1+i+1)), "source":"als"}))
+    # co-view
+    if current_item:
+        cov = co_view_for_item(current_item, top_k=50)
+        for i,iid in enumerate(cov):
+            candidates.append((iid, {"cov_score": float(1.0/(1+i+1)), "source":"co"}))
+    # content sim
+    if current_item:
+        sim = content_similar(current_item, top_k=50)
+        for i,iid in enumerate(sim):
+            candidates.append((iid, {"sim_score": float(1.0/(1+i+1)), "source":"sim"}))
+    # popular
+    pop = popular_candidates(200)
+    for i,iid in enumerate(pop):
+        candidates.append((iid, {"pop_score": float(1.0/(1+i+1)), "source":"pop"}))
+
+    agg = {}
+    for iid, sc in candidates:
+        if iid not in agg:
+            agg[iid] = sc
+        else:
+            for k,v in sc.items():
+                agg[iid][k] = agg[iid].get(k,0) + v
+
+    ids = list(agg.keys())
+    df_cands = prod_df[prod_df["item_id"].isin(ids)].reset_index(drop=True)
+    if df_cands.empty:
+        return popular_candidates(N)
+
+    as_scores = assistant_score(df_cands, assistant_filters)
+    as_map = dict(zip(df_cands["item_id"].tolist(), as_scores.tolist()))
+
+    cand_list = []
+    for iid, info in agg.items():
+        als_s = info.get("als_score", 0)
+        sim_s = info.get("sim_score", 0)
+        cov_s = info.get("cov_score", 0)
+        pop_s = info.get("pop_score", 0)
+        assistant_s = as_map.get(iid, 1.0)
+        final = 0.30*als_s + 0.25*sim_s + 0.20*cov_s + 0.15*pop_s + 0.30*(assistant_s-1)
+        cand_list.append((iid, final))
+
+    cand_list.sort(key=lambda x: x[1], reverse=True)
+
+    filtered = []
+    for iid, score in cand_list:
+        row = prod_df[prod_df["item_id"]==iid].iloc[0]
+        if assistant_filters.get("budget_min") is not None and row["price"] < assistant_filters["budget_min"]:
+            continue
+        if assistant_filters.get("budget_max") is not None and row["price"] > assistant_filters["budget_max"]:
+            continue
+        if assistant_filters.get("brands"):
+            if row["brand"].lower() not in [b.lower() for b in assistant_filters["brands"]]:
+                continue
+        if assistant_filters.get("categories"):
+            if row["category_id"].lower() not in [c.lower() for c in assistant_filters["categories"]]:
+                continue
+        filtered.append((iid, score))
+        if len(filtered) >= N:
+            break
+
+    if len(filtered) < N:
+        for p in pop:
+            if p not in [x[0] for x in filtered]:
+                filtered.append((p, 0.0))
+            if len(filtered) >= N:
+                break
+    return [x[0] for x in filtered[:N]]
+
+# -------------------------
+# UI components
+# -------------------------
+def product_card(row):
+    st.image(row["image_url"] if row["image_url"] else "https://via.placeholder.com/200x150.png?text=No+Image", width=180)
+    st.markdown(f"**{row['title']}**")
+    st.markdown(f"Brand: {row.get('brand','')}")
     try:
         price_int = int(row.get('price', 0))
     except Exception:
         price_int = 0
-    parent_col.markdown(f"Price: ₹{price_int}")
-
-    # create two buttons side-by-side inside this parent column (one-level nesting)
-    bcol1, bcol2 = parent_col.columns([1,1])
-    with bcol1:
-        if bcol1.button("View", key=f"view_{row['item_id']}"):
-            st.session_state['last_viewed'] = row["item_id"]
-            st.session_state['recent_views'] = [row["item_id"]] + st.session_state.get('recent_views', [])
-            st.session_state['recent_views'] = st.session_state['recent_views'][:30]
+    st.markdown(f"Price: ₹{price_int}")
+    col1, col2 = st.columns([1,1])
+    with col1:
+        if st.button("View", key=f"view_{row['item_id']}"):
+            st.session_state.last_viewed = row["item_id"]
+            st.session_state.recent_views.insert(0, row["item_id"])
+            if len(st.session_state.recent_views) > 30:
+                st.session_state.recent_views = st.session_state.recent_views[:30]
             st.experimental_rerun()
-    with bcol2:
-        if bcol2.button("Add to cart", key=f"add_{row['item_id']}"):
-            st.session_state.setdefault('cart', {})
-            st.session_state['cart'][row["item_id"]] = st.session_state['cart'].get(row["item_id"], 0) + 1
+    with col2:
+        if st.button("Add to cart", key=f"add_{row['item_id']}"):
+            st.session_state.cart[row["item_id"]] = st.session_state.cart.get(row["item_id"], 0) + 1
             st.success("Added to cart")
 
 # -------------------------
-# Session state defaults
+# Layout
 # -------------------------
-if "cart" not in st.session_state:
-    st.session_state['cart'] = {}
-if "recent_views" not in st.session_state:
-    st.session_state['recent_views'] = []
-if "last_viewed" not in st.session_state:
-    st.session_state['last_viewed'] = None
-
-# -------------------------
-# Page layout + controls
-# -------------------------
-st.title("🧠 Smart Suggestion App")
-st.markdown("Type a product name, set min/max price (supports `10k`, `10,000`) and press **Enter** or click **Search**.")
-
 left, right = st.columns([1,3])
 
-# Left column: optional assistant + debug
 with left:
-    st.header("Controls & Debug")
-    st.markdown("Use the search box on the right for quick searching. Assistant removed to make search primary.")
+    st.header("🧠 Shopping Assistant")
+    st.markdown("Ask me what you're looking for, e.g.: *'Best gaming laptop under 100000 for streaming'*")
+
+    # Use a form so Enter key works to submit
+    with st.form(key="assistant_form", clear_on_submit=False):
+        assistant_input = st.text_input("Ask the assistant...", key="assistant_input", value="")
+        submitted = st.form_submit_button("Send")
+        if submitted and assistant_input and assistant_input.strip():
+            st.session_state.assistant_history.append(("user", assistant_input))
+            new_filters = parse_assistant_message(assistant_input)
+            st.session_state.filters.update(new_filters)
+            reply_lines = []
+            if "budget_max" in new_filters or "budget_min" in new_filters:
+                bm = new_filters.get("budget_min")
+                bM = new_filters.get("budget_max")
+                if bm and bM:
+                    reply_lines.append(f"Got it — budget set between ₹{bm} and ₹{bM}.")
+                elif bM:
+                    reply_lines.append(f"Okay, I'll look for items under ₹{bM}.")
+                elif bm:
+                    reply_lines.append(f"Okay, I'll look for items above ₹{bm}.")
+            if "use_case" in new_filters:
+                reply_lines.append(f"Use-case: **{new_filters['use_case']}** — I'll favor items suited for that.")
+            if "brands" in new_filters and new_filters["brands"]:
+                reply_lines.append("I will prioritize these brands: " + ", ".join(new_filters["brands"]))
+            if "categories" in new_filters and new_filters["categories"]:
+                reply_lines.append("Focusing on categories: " + ", ".join(new_filters["categories"]))
+            if not reply_lines:
+                reply_lines = ["Okay — searching based on your message."]
+            assistant_reply = " ".join(reply_lines)
+            st.session_state.assistant_history.append(("assistant", assistant_reply))
+            # clear the form input
+            st.experimental_rerun()
+
+    for role, text in st.session_state.assistant_history:
+        if role == "user":
+            st.markdown(f"**You:** {text}")
+        else:
+            st.markdown(f"**Assistant:** {text}")
+
     st.markdown("---")
-    st.markdown("Dataset info")
-    st.write(f"Rows: {prod_df.shape[0]}, Columns: {prod_df.shape[1]}")
-    st.markdown("### Debug: sample rows")
-    st.write(prod_df[['item_id','title','brand','price']].head(8))
+    st.subheader("Quick Filters")
+    vmin, vmax = st.columns(2)
+    with vmin:
+        vmin_val = st.number_input("Min price (₹)", value=st.session_state.filters.get("budget_min") or 0, min_value=0)
+    with vmax:
+        vmax_val = st.number_input("Max price (₹)", value=st.session_state.filters.get("budget_max") or 0, min_value=0)
+    st.session_state.filters["budget_min"] = vmin_val if vmin_val>0 else None
+    st.session_state.filters["budget_max"] = vmax_val if vmax_val>0 else None
+
+    cats = sorted(prod_df["category_id"].dropna().unique().tolist())
+    chosen_cats = st.multiselect("Categories", options=cats, default=st.session_state.filters.get("categories") or [])
+    st.session_state.filters["categories"] = chosen_cats
+
+    brands = sorted(prod_df["brand"].dropna().unique().tolist())
+    chosen_brands = st.multiselect("Brands", options=brands[:200], default=st.session_state.filters.get("brands") or [])
+    st.session_state.filters["brands"] = chosen_brands
+
+    if st.button("Clear assistant filters"):
+        st.session_state.filters = {"budget_min": None, "budget_max": None, "brands": [], "use_case": None, "categories": []}
+        st.session_state.assistant_history.append(("assistant", "Cleared filters. How else can I help?"))
+        st.experimental_rerun()
+
     st.markdown("---")
-    st.markdown("Uploaded debug file path")
-    st.code(UPLOADED_DEBUG_FILE)
-    if os.path.exists(UPLOADED_DEBUG_FILE):
-        if st.button("Preview uploaded JSON"):
-            try:
-                with open(UPLOADED_DEBUG_FILE, "r") as f:
-                    st.json(json.load(f))
-            except Exception as e:
-                st.write("Could not open debug file:", e)
-    st.markdown("---")
-    st.markdown("Cart")
-    cart = st.session_state.get('cart', {})
-    if cart:
+    st.subheader("Cart")
+    if st.session_state.cart:
         total = 0
-        for iid, qty in cart.items():
-            r = prod_df[prod_df['item_id']==iid]
-            if not r.empty:
-                p = int(r.iloc[0].get('price',0))
-                st.write(f"{r.iloc[0]['title']} — {qty} x ₹{p} = ₹{qty*p}")
-                total += qty*p
+        for iid, qty in st.session_state.cart.items():
+            row = prod_df[prod_df["item_id"]==iid]
+            if not row.empty:
+                try:
+                    price = int(row.iloc[0]["price"])
+                except Exception:
+                    price = 0
+                st.write(f"{row.iloc[0]['title']} — {qty} x ₹{price} = ₹{qty*price}")
+                total += qty*price
         st.markdown(f"**Total: ₹{total}**")
         if st.button("Checkout"):
             st.success("Checkout simulated — order placed (demo).")
-            st.session_state['cart'] = {}
+            st.session_state.cart = {}
     else:
-        st.write("Cart empty")
+        st.write("Cart is empty")
 
-# Right column: search and results
 with right:
-    with st.form("search_form"):
-        col_q, col_min, col_max, col_btn = st.columns([3,1,1,1])
-        with col_q:
-            q_text = st.text_input("Search products (e.g. 'mobile')", key="q_text")
-        with col_min:
-            min_raw = st.text_input("Min price (₹) — allow 10k", value="0", key="min_raw")
-        with col_max:
-            max_raw = st.text_input("Max price (₹) — allow 15k", value="0", key="max_raw")
-        with col_btn:
-            submitted = st.form_submit_button("Search")
-    # parse price inputs
-    min_price = parse_price_input_raw(min_raw)
-    max_price = parse_price_input_raw(max_raw)
-    min_price_bound = None if min_price == 0 else min_price
-    max_price_bound = None if max_price == 0 else max_price
+    st.header("Products")
+    q = st.text_input("Search products (keywords, e.g. 'gaming laptop i7')", key="search_q")
+    sort_opt = st.selectbox("Sort by", options=["Relevance (assistant)","Price: Low to High","Price: High to Low","Newest"], index=0)
+    per_page = st.selectbox("Show", options=[12, 24, 48], index=1)
 
-    # debug: show parsed values
-    st.markdown(f"**Parsed price filter:** min = {min_price_bound}, max = {max_price_bound}")
+    current_item = st.session_state.get("last_viewed", None)
+    assistant_filters = st.session_state.filters.copy()
+    if q and len(q.strip())>0:
+        parsed = parse_assistant_message(q)
+        assistant_filters.update(parsed)
+    user_id = st.session_state.get("user_id", None)
 
-    if submitted:
-        results = search_products(q_text, min_price_bound, max_price_bound)
+    candidates = merge_and_score(user_id, current_item, assistant_filters, N=per_page)
+    if q and q.strip():
+        ql = q.lower()
+        cand_rows = prod_df[prod_df["item_id"].isin(candidates)].copy()
+        cand_rows["match"] = (cand_rows["title"].str.lower().str.contains(ql) | cand_rows["description"].str.lower().str.contains(ql)).astype(int)
+        cand_rows = cand_rows.sort_values(["match"], ascending=False)
     else:
-        results = prod_df.sort_values('price', ascending=False).reset_index(drop=True)
+        cand_rows = prod_df[prod_df["item_id"].isin(candidates)].copy()
 
-    st.subheader(f"Found {len(results)} products")
-    if results.empty:
-        st.write("No products found. Try a broader query or remove price filters.")
+    if sort_opt == "Price: Low to High":
+        cand_rows = cand_rows.sort_values("price", ascending=True)
+    elif sort_opt == "Price: High to Low":
+        cand_rows = cand_rows.sort_values("price", ascending=False)
+
+    if cand_rows.empty:
+        st.write("No items to show — check data (see sidebar debug).")
     else:
         cols = st.columns(3)
-        for i, (_, row) in enumerate(results.head(60).iterrows()):
-            parent_col = cols[i % 3]
-            product_card(parent_col, row)
+        for i, (_, row) in enumerate(cand_rows.head(per_page).iterrows()):
+            with cols[i % 3]:
+                product_card(row)
 
-    # product details + recommendations
-    lv = st.session_state.get('last_viewed', None)
-    if lv:
+    if current_item:
         st.markdown("---")
         st.subheader("Product details")
-        prow = prod_df[prod_df['item_id']==lv].iloc[0]
-        st.image(prow['image_url'] if prow['image_url'] else 'https://via.placeholder.com/400x300.png?text=No+Image')
-        st.markdown(f"### {prow['title']}")
-        st.write(prow.get('description',''))
-        st.write(f"Brand: {prow.get('brand','')}  — Price: ₹{int(prow.get('price',0))}")
-        st.markdown("**Recommendations for this product**")
-        recs = rec_content_sim(lv, top_k=6)
-        if not recs:
-            st.write("No content-based recommendations available.")
-        else:
-            for rid in recs:
-                rrow = prod_df[prod_df['item_id']==rid].iloc[0]
-                st.write(f"- {rrow['title']} — ₹{int(rrow.get('price',0))}")
+        row = prod_df[prod_df["item_id"]==current_item].iloc[0]
+        left_col, mid_col, right_col = st.columns([2,3,2])
+        with left_col:
+            st.image(row["image_url"] if row["image_url"] else "https://via.placeholder.com/400x300.png?text=No+Image")
+        with mid_col:
+            st.markdown(f"### {row['title']}")
+            st.markdown(f"**Brand:** {row['brand']}  •  **Category:** {row['category_id']}")
+            try:
+                price_display = int(row['price'])
+            except Exception:
+                price_display = 0
+            st.markdown(f"**Price:** ₹{price_display}")
+            st.markdown(row.get("description",""))
+            if st.button("Add to cart (product page)"):
+                st.session_state.cart[current_item] = st.session_state.cart.get(current_item,0) + 1
+                st.success("Added to cart")
+        with right_col:
+            st.markdown("**Recommendations for this product**")
+            sim = content_similar(current_item, top_k=6)
+            for s in sim:
+                r = prod_df[prod_df["item_id"]==s].iloc[0]
+                try:
+                    rp = int(r['price'])
+                except Exception:
+                    rp = 0
+                st.write(f"- {r['title']} — ₹{rp}")
 
-# End
+# Footer / debug
+st.sidebar.markdown("### App status")
+st.sidebar.write("Hybrid Amazon-Full demo — Assistant + content-sim + co-view merge")
+st.sidebar.write("Artifacts detected:")
+for k,v in arts.items():
+    st.sidebar.write(f"- {k}: {'Loaded' if v else 'Missing'}")
+
+# debug: show dataset info
+st.sidebar.markdown("---")
+st.sidebar.markdown("### Debug: prod_df")
+st.sidebar.write(f"rows: {prod_df.shape[0]}, cols: {prod_df.shape[1]}")
+st.sidebar.write(prod_df.head(5))
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("Debug: uploaded file (raw) path")
+st.sidebar.code(UPLOADED_DEBUG_FILE)
+if st.sidebar.button("Preview uploaded file"):
+    try:
+        with open(UPLOADED_DEBUG_FILE, "r") as f:
+            data = json.load(f)
+        st.sidebar.write(data if isinstance(data, dict) else str(data)[:1000])
+    except Exception as e:
+        st.sidebar.write("Could not open uploaded debug file:", e)
+
+st.sidebar.markdown("Made with ❤️ — Smart Recommender Demo")
