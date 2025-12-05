@@ -7,3 +7,13 @@ tqdm==4.66.1
 # add scikit-learn or implicit below if you want them built in Docker
 # scikit-learn==1.2.2
 # implicit==0.4.8
+fastapi
+uvicorn
+
+streamlit
+requests
+pandas
+
+scikit-learn
+xgboost
+
