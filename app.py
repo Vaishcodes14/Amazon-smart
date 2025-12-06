@@ -4,6 +4,8 @@
 # - Lightweight TF-IDF recommender (no sklearn)
 # - Search form, price parsing, product grid, product details, cart
 # - FIXED: no illegal nested column calls in Streamlit
+# - UPDATED: brand-aware search (e.g. "redmi" → all Redmi products, up to 10)
+# - UPDATED: "People also buy this with" using co_view_top.json
 
 import os
 import re
@@ -136,6 +138,22 @@ def build_text_index(df: pd.DataFrame):
     index_map = {i: df.reset_index(drop=True).loc[i, 'item_id'] for i in range(len(df))}
     return {'vocab': vocab, 'mat': mat, 'index_map': index_map}
 
+# ---------------- LOAD CO-VIEW ("PEOPLE ALSO BUY") DATA ----------------
+@st.cache_resource
+def load_co_view_top(path: str = os.path.join(BASE_DIR, "co_view_top.json")) -> Dict[str, list]:
+    """
+    Load mapping: item_id -> list of item_ids that people also viewed/bought with it.
+    """
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return {str(k): v for k, v in data.items()}
+        except Exception:
+            pass
+    return {}
+
 # ---------------- HELPERS ----------------
 def parse_price_input_raw(s: Any) -> int:
     if s is None:
@@ -152,24 +170,40 @@ def parse_price_input_raw(s: Any) -> int:
     except:
         return 0
 
-def search_products(df, query, min_price=None, max_price=None):
+def search_products(df: pd.DataFrame, query: str, min_price: Optional[int] = None, max_price: Optional[int] = None) -> pd.DataFrame:
+    """
+    Search products by brand + title + description + category.
+    Example: query='redmi' => all Redmi products (up to 10).
+    """
     q = str(query).strip().lower()
     out = df.copy()
+
     if q:
-        mask = out['title'].fillna('').str.lower().str.contains(q) | out['description'].fillna('').str.lower().str.contains(q)
+        brand_match = out['brand'].fillna('').str.lower().str.contains(q)
+        title_match = out['title'].fillna('').str.lower().str.contains(q)
+        desc_match = out['description'].fillna('').str.lower().str.contains(q)
+        cat_match = out['category_id'].fillna('').str.lower().str.contains(q)
+
+        mask = brand_match | title_match | desc_match | cat_match
         out = out[mask]
+
     if min_price is not None:
-        out = out[out['price'] >= min_price]
+        out = out[out['price'] >= int(min_price)]
     if max_price is not None and max_price > 0:
-        out = out[out['price'] <= max_price]
+        out = out[out['price'] <= int(max_price)]
+
+    # Show at most 10 results (top 10 matches)
+    out = out.sort_values('price', ascending=False).head(10)
+
     return out.reset_index(drop=True)
 
 def rec_content_sim(item_id: str, text_index, top_k=6):
     idx_map = text_index['index_map']
     item_to_idx = {str(v): k for k, v in idx_map.items()}
-    if item_id not in item_to_idx:
+    key = str(item_id)
+    if key not in item_to_idx:
         return []
-    idx = item_to_idx[item_id]
+    idx = item_to_idx[key]
     mat = text_index['mat']
     sims = cosine_sim_rows(mat, idx)
     order = np.argsort(sims)[::-1]
@@ -211,6 +245,7 @@ if "last_viewed" not in st.session_state:
 
 prod_df = load_prod_meta()
 text_index = build_text_index(prod_df)
+CO_VIEW_TOP = load_co_view_top()
 
 # ---------------- UI ----------------
 st.title("🧠 Smart Suggestion App")
@@ -227,7 +262,7 @@ with left:
 with right:
     with st.form("search_form"):
         col_q, col_min, col_max, col_btn = st.columns([3,1,1,1])
-        q_text = col_q.text_input("Search product")
+        q_text = col_q.text_input("Search product (e.g. 'redmi')")
         min_raw = col_min.text_input("Min ₹ (supports 10k)", "0")
         max_raw = col_max.text_input("Max ₹ (supports 10k)", "0")
         submitted = col_btn.form_submit_button("Search")
@@ -247,16 +282,39 @@ with right:
     lv = st.session_state.get('last_viewed')
     if lv:
         st.markdown("---")
+        st.subheader("Product details")
+
         prow = prod_df[prod_df['item_id'] == lv].iloc[0]
         st.image(prow.get("image_url") or "https://via.placeholder.com/400")
-        st.subheader(prow.get("title"))
-        st.write(prow.get("description"))
+        st.markdown(f"### {prow.get('title')}")
+        st.write(prow.get('description'))
         st.write(f"Brand: {prow.get('brand','')} — ₹{int(prow.get('price',0))}")
-        st.markdown("**Similar products**")
-        recs = rec_content_sim(lv, text_index, top_k=6)
-        for rid in recs:
-            rrow = prod_df[prod_df['item_id'] == rid].iloc[0]
-            st.write(f"- {rrow['title']} — ₹{int(rrow['price'])}")
+
+        # 1️⃣ People also buy this with...
+        st.markdown("**People also buy this with:**")
+        also_ids = CO_VIEW_TOP.get(str(lv), []) or []
+        if also_ids:
+            for rid in also_ids[:5]:
+                rrow = prod_df[prod_df['item_id'] == rid]
+                if rrow.empty:
+                    continue
+                rrow = rrow.iloc[0]
+                st.write(f"- {rrow.get('title')} — ₹{int(rrow.get('price',0))}")
+        else:
+            st.write("No co-purchase data available for this product.")
+
+        # 2️⃣ Similar products (content-based)
+        st.markdown("**Similar products you may like:**")
+        recs = rec_content_sim(str(lv), text_index, top_k=6)
+        if not recs:
+            st.write("No content-based recommendations available.")
+        else:
+            for rid in recs:
+                rrow = prod_df[prod_df['item_id'] == rid]
+                if rrow.empty:
+                    continue
+                rrow = rrow.iloc[0]
+                st.write(f"- {rrow['title']} — ₹{int(rrow['price'])}")
 
 # ---------------- SIDEBAR CART ----------------
 st.sidebar.header("Cart")
