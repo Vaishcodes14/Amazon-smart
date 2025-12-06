@@ -1,18 +1,10 @@
-# app.py
-# Smart Suggestion App - corrected, robust version
-# - Robust CSV loader that auto-cleans malformed rows (fixes ParserError)
-# - Lightweight TF-IDF recommender (no sklearn)
-# - Search form, price parsing, product grid, product details, cart
-# - FIXED: no illegal nested column calls in Streamlit
-# - UPDATED: brand-aware search (e.g. "redmi" → all Redmi products, up to 10)
-# - UPDATED: "People also buy this with" using co_view_top.json
-
+# app.py — FINAL ENHANCED VERSION
 import os
 import re
 import math
 import json
 from collections import Counter, defaultdict
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import numpy as np
@@ -20,319 +12,226 @@ import streamlit as st
 from pandas.errors import ParserError
 import csv
 
-UPLOADED_DEBUG_FILE = "/mnt/data/eaef5e07-5416-44ce-90af-b3484e5b8768.json"
-MARKETING_IMAGE = "/mnt/data/WhatsApp Image 2025-11-04 at 20.27.51.jpeg"
-LOG_PATH = "/mnt/data/logs-vaishcodes14-amazon-smart-main-app.py-2025-11-22T03_44_24.581Z.txt"
-
 st.set_page_config(page_title="Smart Suggestion App", layout="wide")
 
 BASE_DIR = "./data"
-os.makedirs(BASE_DIR, exist_ok=True)
 CSV_PATH = os.path.join(BASE_DIR, "prod_meta.csv")
 CLEANED_CSV_PATH = os.path.join(BASE_DIR, "prod_meta.cleaned.csv")
-
-# ---------------- TF-IDF HELPERS ----------------
-def tokenize(text: Any) -> List[str]:
-    toks = re.findall(r"[a-z0-9]+", str(text).lower())
-    return [t for t in toks if len(t) > 1]
-
-def build_tfidf_matrix(docs: List[str], max_features: int = 6000):
-    doc_tokens = [tokenize(d) for d in docs]
-    term_doc_count = defaultdict(int)
-    term_freqs = []
-    for tokens in doc_tokens:
-        c = Counter(tokens)
-        term_freqs.append(c)
-        for t in c.keys():
-            term_doc_count[t] += 1
-    terms_sorted = sorted(term_doc_count.items(), key=lambda x: x[1], reverse=True)
-    vocab = [t for t, _ in terms_sorted[:max_features]]
-    vocab_index = {t: i for i, t in enumerate(vocab)}
-    n_docs = len(docs)
-    n_terms = len(vocab)
-    if n_docs == 0 or n_terms == 0:
-        return vocab, np.zeros((n_docs, n_terms), dtype=np.float32)
-    idf = np.zeros(n_terms, dtype=np.float32)
-    for t, i in vocab_index.items():
-        df = term_doc_count.get(t, 0)
-        idf[i] = math.log((1 + n_docs) / (1 + df)) + 1.0
-    mat = np.zeros((n_docs, n_terms), dtype=np.float32)
-    for d_idx, c in enumerate(term_freqs):
-        norm = 0.0
-        for t, freq in c.items():
-            if t in vocab_index:
-                idx = vocab_index[t]
-                tfidf = freq * idf[idx]
-                mat[d_idx, idx] = tfidf
-                norm += tfidf * tfidf
-        if norm > 0:
-            mat[d_idx, :] = mat[d_idx, :] / math.sqrt(norm)
-    return vocab, mat
-
-def cosine_sim_rows(mat: np.ndarray, query_idx: int) -> np.ndarray:
-    if mat is None or mat.size == 0:
-        return np.array([])
-    q = mat[query_idx]
-    sims = mat.dot(q)
-    return sims
-
-# ---------------- CSV CLEANING ----------------
 EXPECTED_FIELDS = ["item_id","title","category_id","brand","price","item_code","image_url","description"]
 
-def repair_csv_join_extras(in_path: str, out_path: str, expected_cols_count: int = 8):
+# ---------------- LOAD CSV ----------------
+def repair_csv(in_path, out_path, expected=8):
     fixed = 0
-    total = 0
-    with open(in_path, newline='', encoding='utf-8') as fin, \
-         open(out_path, 'w', newline='', encoding='utf-8') as fout:
-        reader = csv.reader(fin)
-        writer = csv.writer(fout, quoting=csv.QUOTE_MINIMAL)
-        for i, row in enumerate(reader, start=1):
-            total += 1
-            if len(row) == expected_cols_count:
-                writer.writerow(row)
-            elif len(row) < expected_cols_count:
-                row2 = row + [""]*(expected_cols_count - len(row))
-                writer.writerow(row2[:expected_cols_count])
-                fixed += 1
+    with open(in_path, newline='', encoding='utf-8') as fin, open(out_path, 'w', newline='', encoding='utf-8') as fout:
+        r = csv.reader(fin); w = csv.writer(fout)
+        for row in r:
+            if len(row) == expected:
+                w.writerow(row)
+            elif len(row) < expected:
+                w.writerow(row + [""] * (expected - len(row))); fixed += 1
             else:
-                first = row[:expected_cols_count-1]
-                last = ",".join(row[expected_cols_count-1:])
-                first.append(last)
-                writer.writerow(first)
-                fixed += 1
-    return {"total": total, "fixed": fixed, "out_path": out_path}
+                w.writerow(row[:expected-1] + [",".join(row[expected-1:])]); fixed += 1
+    return fixed
 
-# ---------------- LOAD & CLEAN CSV ----------------
 @st.cache_resource
-def load_prod_meta(path: str = CSV_PATH) -> pd.DataFrame:
-    if not os.path.exists(path):
-        sample = [
-            ["p001","Pixel 6a","phones","Google",19999,1001,"https://via.placeholder.com/200x150.png?text=Pixel+6a","Google Pixel 6a smartphone."],
-            ["p002","Galaxy A23","phones","Samsung",14999,1002,"https://via.placeholder.com/200x150.png?text=Galaxy+A23","Samsung A23 - 4GB RAM, 64GB."],
-        ]
-        df = pd.DataFrame(sample, columns=EXPECTED_FIELDS)
-        df['price'] = pd.to_numeric(df['price'], errors='coerce').fillna(0).astype(int)
-        return df
+def load_df():
+    if not os.path.exists(CSV_PATH):
+        return pd.DataFrame(columns=EXPECTED_FIELDS)
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(CSV_PATH)
     except ParserError:
-        repair_info = repair_csv_join_extras(path, CLEANED_CSV_PATH, expected_cols_count=len(EXPECTED_FIELDS))
-        try:
-            df = pd.read_csv(repair_info["out_path"])
-            st.warning(f"prod_meta.csv repaired {repair_info['fixed']} rows.")
-        except:
-            df = pd.DataFrame([], columns=EXPECTED_FIELDS)
-            return df
+        repair_csv(CSV_PATH, CLEANED_CSV_PATH)
+        df = pd.read_csv(CLEANED_CSV_PATH)
     df.columns = [c.strip() for c in df.columns]
     for c in EXPECTED_FIELDS:
         if c not in df.columns:
             df[c] = ""
-    df['price'] = pd.to_numeric(df['price'].astype(str).str.replace(',',''), errors='coerce').fillna(0).astype(int)
-    return df
+    df["price"] = pd.to_numeric(df["price"], errors="coerce").fillna(0).astype(int)
+    df["year"] = (
+        df["description"]
+        .str.extract(r"(20[2-9][0-9])")
+        .fillna("2022")
+        .astype(int)
+        .clip(2020, 2025)
+    )
+    return df.reset_index(drop=True)
 
-# ---------------- BUILD TEXT INDEX ----------------
-@st.cache_resource
-def build_text_index(df: pd.DataFrame):
-    docs = (df['title'].fillna('') + ' ' + df['description'].fillna('')).astype(str).tolist()
-    vocab, mat = build_tfidf_matrix(docs, max_features=4000)
-    index_map = {i: df.reset_index(drop=True).loc[i, 'item_id'] for i in range(len(df))}
-    return {'vocab': vocab, 'mat': mat, 'index_map': index_map}
+# ---------------- TF-IDF ----------------
+def tokenize(t): return [w for w in re.findall(r"[a-z0-9]+", str(t).lower()) if len(w) > 1]
 
-# ---------------- LOAD CO-VIEW ("PEOPLE ALSO BUY") DATA ----------------
+def build_tfidf(docs):
+    doc_tok = [tokenize(x) for x in docs]
+    freqs = []; dfreq = defaultdict(int)
+    for t in doc_tok:
+        c = Counter(t); freqs.append(c)
+        for k in c: dfreq[k] += 1
+    vocab = sorted(dfreq, key=dfreq.get, reverse=True)[:5000]
+    idx = {t:i for i,t in enumerate(vocab)}
+    n, m = len(docs), len(vocab)
+    mat = np.zeros((n, m), float)
+    idf = np.zeros(m, float)
+    for t,i in idx.items(): idf[i] = math.log((1+n)/(1+dfreq[t])) + 1
+    for r, c in enumerate(freqs):
+        s = 0
+        for t,f in c.items():
+            if t in idx:
+                val = f * idf[idx[t]]
+                mat[r, idx[t]] = val; s += val*val
+        if s > 0: mat[r] /= math.sqrt(s)
+    return vocab, mat
+
+def cosine_sim(mat, i): return mat.dot(mat[i])
+
 @st.cache_resource
-def load_co_view_top(path: str = os.path.join(BASE_DIR, "co_view_top.json")) -> Dict[str, list]:
-    """
-    Load mapping: item_id -> list of item_ids that people also viewed/bought with it.
-    """
+def build_text_index(df):
+    docs = (df["title"] + " " + df["description"]).tolist()
+    _, M = build_tfidf(docs)
+    return {"mat": M, "index": {i: df.loc[i,"item_id"] for i in range(len(df))}}
+
+# ---------------- CO-VIEW ----------------
+@st.cache_resource
+def load_coview():
+    path = os.path.join(BASE_DIR, "co_view_top.json")
     if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return {str(k): v for k, v in data.items()}
-        except Exception:
-            pass
+        try: return json.load(open(path, "r", encoding="utf-8"))
+        except: return {}
     return {}
 
 # ---------------- HELPERS ----------------
-def parse_price_input_raw(s: Any) -> int:
-    if s is None:
-        return 0
-    stx = str(s).strip().lower()
-    stx = stx.replace(",", "").replace("₹", "").replace("inr", "")
-    if stx.endswith("k"):
-        try:
-            return int(float(stx[:-1]) * 1000)
-        except:
-            return 0
-    try:
-        return int(float(stx))
-    except:
-        return 0
+def parse_price(s):
+    if not s: return 0
+    s = s.lower().replace("₹","").replace(",","")
+    if s.endswith("k"):
+        try: return int(float(s[:-1]) * 1000)
+        except: return 0
+    try: return int(float(s))
+    except: return 0
 
-def search_products(df: pd.DataFrame, query: str, min_price: Optional[int] = None, max_price: Optional[int] = None) -> pd.DataFrame:
-    """
-    Search products by brand + title + description + category.
-    Example: query='redmi' => all Redmi products (up to 10).
-    """
-    q = str(query).strip().lower()
-    out = df.copy()
-
+def search(df, q, cat, year, minp, maxp):
+    q = q.lower().strip()
+    out = df
     if q:
-        brand_match = out['brand'].fillna('').str.lower().str.contains(q)
-        title_match = out['title'].fillna('').str.lower().str.contains(q)
-        desc_match = out['description'].fillna('').str.lower().str.contains(q)
-        cat_match = out['category_id'].fillna('').str.lower().str.contains(q)
+        mask = df["title"].str.lower().str.contains(q) | df["brand"].str.lower().str.contains(q) | df["category_id"].str.lower().str.contains(q)
+        out = df[mask]
 
-        mask = brand_match | title_match | desc_match | cat_match
-        out = out[mask]
+    if cat != "All":
+        out = out[out["category_id"] == cat]
+    if year != "All":
+        out = out[out["year"] == int(year)]
+    if minp: out = out[out["price"] >= minp]
+    if maxp: out = out[out["price"] <= maxp]
+    return out
 
-    if min_price is not None:
-        out = out[out['price'] >= int(min_price)]
-    if max_price is not None and max_price > 0:
-        out = out[out['price'] <= int(max_price)]
-
-    # Show at most 10 results (top 10 matches)
-    out = out.sort_values('price', ascending=False).head(10)
-
-    return out.reset_index(drop=True)
-
-def rec_content_sim(item_id: str, text_index, top_k=6):
-    idx_map = text_index['index_map']
-    item_to_idx = {str(v): k for k, v in idx_map.items()}
-    key = str(item_id)
-    if key not in item_to_idx:
-        return []
-    idx = item_to_idx[key]
-    mat = text_index['mat']
-    sims = cosine_sim_rows(mat, idx)
-    order = np.argsort(sims)[::-1]
-    res = []
+def rec_similar(pid, index):
+    i_map = index["index"]
+    inv = {v:k for k,v in i_map.items()}
+    if pid not in inv: return []
+    sims = cosine_sim(index["mat"], inv[pid])
+    order = sims.argsort()[::-1]
+    out = []
     for o in order:
-        if o == idx:
-            continue
-        res.append(idx_map[o])
-        if len(res) >= top_k:
-            break
-    return res
+        if o == inv[pid]: continue
+        out.append(i_map[o])
+        if len(out) >= 6: break
+    return out
 
-# ---------------- FIXED PRODUCT CARD ----------------
-def product_card(parent_col, row):
-    parent_col.image(row.get("image_url") or "https://via.placeholder.com/200x150.png?text=No+Image", width=180)
-    parent_col.markdown(f"**{row.get('title','')}**")
-    parent_col.markdown(f"Brand: {row.get('brand','')}")
-    price = int(row.get('price', 0))
-    parent_col.markdown(f"Price: ₹{price}")
-
-    # FIXED: no nested columns
-    with parent_col:
-        bcol1, bcol2 = st.columns([1, 1])
-        with bcol1:
-            if st.button("View", key=f"view_{row['item_id']}"):
-                st.session_state['last_viewed'] = row['item_id']
-                st.experimental_rerun()
-        with bcol2:
-            if st.button("Add to cart", key=f"add_{row['item_id']}"):
-                st.session_state.setdefault('cart', {})
-                st.session_state['cart'][row['item_id']] = st.session_state['cart'].get(row['item_id'], 0) + 1
-                st.success("Added to cart")
+def card(col, r):
+    with col:
+        st.image(r["image_url"] or "https://via.placeholder.com/200", width=180)
+        st.markdown(f"**{r['title']}**")
+        st.write(f"{r['brand']}  |  ₹{r['price']}")
+        if st.button("👁 View", key=f"v_{r['item_id']}"):
+            st.session_state["view"] = r["item_id"]; st.experimental_rerun()
+        if st.button("🛒 Add", key=f"a_{r['item_id']}"):
+            st.session_state["cart"][r["item_id"]] = st.session_state["cart"].get(r["item_id"],0)+1
+            st.success("Added ✓")
 
 # ---------------- SESSION ----------------
-if "cart" not in st.session_state:
-    st.session_state['cart'] = {}
-if "last_viewed" not in st.session_state:
-    st.session_state['last_viewed'] = None
+if "view" not in st.session_state: st.session_state["view"] = None
+if "cart" not in st.session_state: st.session_state["cart"] = {}
+if "recent" not in st.session_state: st.session_state["recent"] = []
 
-prod_df = load_prod_meta()
-text_index = build_text_index(prod_df)
-CO_VIEW_TOP = load_co_view_top()
+# ---------------- LOAD ----------------
+df = load_df()
+text = build_text_index(df)
+coview = load_coview()
 
 # ---------------- UI ----------------
-st.title("🧠 Smart Suggestion App")
-st.markdown("Search product & get similar recommendations!")
+st.title("🧠 Smart Product Recommendation Engine")
 
-left, right = st.columns([1,3])
+with st.sidebar:
+    st.header("Filters")
+    q = st.text_input("Search")
+    cat = st.selectbox("Category", ["All"] + sorted(df["category_id"].unique().tolist()))
+    year = st.selectbox("Year", ["All"] + sorted(df["year"].unique().tolist()))
+    minp = parse_price(st.text_input("Min price", "0"))
+    maxp = parse_price(st.text_input("Max price", "0"))
+    sort = st.selectbox("Sort by", ["Relevance", "Price high → low", "Price low → high", "Newest first"])
 
-with left:
-    st.header("Marketing Idea")
-    if os.path.exists(MARKETING_IMAGE):
-        st.image(MARKETING_IMAGE, caption="Marketing Idea")
-    st.write(f"Dataset size: {prod_df.shape[0]} rows")
+res = search(df, q, cat, year, minp, maxp)
 
-with right:
-    with st.form("search_form"):
-        col_q, col_min, col_max, col_btn = st.columns([3,1,1,1])
-        q_text = col_q.text_input("Search product (e.g. 'redmi')")
-        min_raw = col_min.text_input("Min ₹ (supports 10k)", "0")
-        max_raw = col_max.text_input("Max ₹ (supports 10k)", "0")
-        submitted = col_btn.form_submit_button("Search")
+if sort == "Price high → low": res = res.sort_values("price", ascending=False)
+elif sort == "Price low → high": res = res.sort_values("price", ascending=True)
+elif sort == "Newest first": res = res.sort_values("year", ascending=False)
 
-    min_p = parse_price_input_raw(min_raw)
-    max_p = parse_price_input_raw(max_raw)
-    min_b = None if min_p == 0 else min_p
-    max_b = None if max_p == 0 else max_p
+st.subheader(f"{len(res)} products found")
+cols = st.columns(3)
+for i, (_, r) in enumerate(res.head(12).iterrows()):
+    card(cols[i % 3], r)
 
-    results = search_products(prod_df, q_text, min_b, max_b) if submitted else prod_df
-    st.subheader(f"{len(results)} products found")
+# ---------------- DETAILS ----------------
+if st.session_state["view"]:
+    pid = st.session_state["view"]
+    pr = df[df["item_id"] == pid].iloc[0]
+    st.markdown("---")
+    st.header(pr["title"])
+    st.image(pr["image_url"], width=350)
+    st.write(pr["description"])
+    st.write(f"Brand: {pr['brand']} | ₹{pr['price']} | Year: {pr['year']}")
 
+    # Save recent view
+    if pid not in st.session_state["recent"]:
+        st.session_state["recent"].insert(0, pid)
+        st.session_state["recent"] = st.session_state["recent"][:10]
+
+    st.subheader("People also buy:")
+    for rid in coview.get(pid, [])[:5]:
+        r = df[df["item_id"] == rid]
+        if not r.empty:
+            rr = r.iloc[0]
+            st.write(f"- {rr['title']} — ₹{rr['price']}")
+
+    st.subheader("Similar products:")
+    for rid in rec_similar(pid, text):
+        r = df[df["item_id"] == rid]
+        if not r.empty:
+            rr = r.iloc[0]
+            st.write(f"- {rr['title']} — ₹{rr['price']}")
+
+# ---------------- TRENDING ----------------
+st.markdown("---")
+st.subheader("🔥 Trending")
+popular = df.sample(6, random_state=1)
+cols = st.columns(3)
+for i,(_,r) in enumerate(popular.iterrows()):
+    card(cols[i % 3], r)
+
+# ---------------- RECENTLY VIEWED ----------------
+if st.session_state["recent"]:
+    st.markdown("---")
+    st.subheader("⏱ Recently viewed")
     cols = st.columns(3)
-    for i, (_, row) in enumerate(results.head(60).iterrows()):
-        product_card(cols[i % 3], row)
+    for i, pid in enumerate(st.session_state["recent"][:6]):
+        r = df[df["item_id"] == pid].iloc[0]
+        card(cols[i % 3], r)
 
-    lv = st.session_state.get('last_viewed')
-    if lv:
-        st.markdown("---")
-        st.subheader("Product details")
-
-        prow = prod_df[prod_df['item_id'] == lv].iloc[0]
-        st.image(prow.get("image_url") or "https://via.placeholder.com/400")
-        st.markdown(f"### {prow.get('title')}")
-        st.write(prow.get('description'))
-        st.write(f"Brand: {prow.get('brand','')} — ₹{int(prow.get('price',0))}")
-
-        # 1️⃣ People also buy this with...
-        st.markdown("**People also buy this with:**")
-        also_ids = CO_VIEW_TOP.get(str(lv), []) or []
-        if also_ids:
-            for rid in also_ids[:5]:
-                rrow = prod_df[prod_df['item_id'] == rid]
-                if rrow.empty:
-                    continue
-                rrow = rrow.iloc[0]
-                st.write(f"- {rrow.get('title')} — ₹{int(rrow.get('price',0))}")
-        else:
-            st.write("No co-purchase data available for this product.")
-
-        # 2️⃣ Similar products (content-based)
-        st.markdown("**Similar products you may like:**")
-        recs = rec_content_sim(str(lv), text_index, top_k=6)
-        if not recs:
-            st.write("No content-based recommendations available.")
-        else:
-            for rid in recs:
-                rrow = prod_df[prod_df['item_id'] == rid]
-                if rrow.empty:
-                    continue
-                rrow = rrow.iloc[0]
-                st.write(f"- {rrow['title']} — ₹{int(rrow['price'])}")
-
-# ---------------- SIDEBAR CART ----------------
+# ---------------- CART ----------------
 st.sidebar.header("Cart")
-cart = st.session_state['cart']
-if cart:
-    total = 0
-    for iid, qty in cart.items():
-        row = prod_df[prod_df['item_id'] == iid]
-        if not row.empty:
-            price = int(row.iloc[0]['price'])
-            st.sidebar.write(f"{row.iloc[0]['title']} — {qty} × ₹{price} = ₹{qty*price}")
-            total += qty * price
-    st.sidebar.write(f"**Total: ₹{total}**")
-    if st.sidebar.button("Checkout"):
-        st.sidebar.success("Order placed (demo)")
-        st.session_state['cart'] = {}
-else:
-    st.sidebar.write("Cart is empty")
-
-st.sidebar.markdown("---")
-st.sidebar.write("Made with ❤️ Smart Recommender Demo")
+total = 0
+for pid, qty in st.session_state["cart"].items():
+    r = df[df["item_id"] == pid]
+    if not r.empty:
+        pr = r.iloc[0]
+        st.sidebar.write(f"{pr['title']} × {qty} = ₹{qty * pr['price']}")
+        total += qty * pr['price']
+st.sidebar.write(f"Total: ₹{total}")
